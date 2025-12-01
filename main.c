@@ -33,6 +33,8 @@
 #include <rte_mbuf.h>
 #include <rte_string_fns.h>
 #include <rte_reorder.h>
+#include <rte_ring.h>
+#include <rte_atomic.h>
 
 #define RTE_LOGTYPE_MACSEC_REORDER RTE_LOGTYPE_USER1
 
@@ -41,10 +43,11 @@
 #define RTE_ETHER_TYPE_MACSEC 0x88E5
 #endif
 
-#define MAX_PKT_BURST 32
+#define MAX_PKT_BURST 64  /* Increased for 100Gbps */
 #define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 #define MEMPOOL_CACHE_SIZE 256
 #define REORDER_BUFFER_SIZE 8192
+#define RING_SIZE 16384  /* Size of rings for inter-thread communication */
 
 /* Configurable number of RX/TX ring descriptors */
 #define RX_DESC_DEFAULT 1024
@@ -99,24 +102,63 @@ static struct rte_reorder_buffer *reorder_buffer_port2_to_port1;
 static struct rte_eth_dev_tx_buffer *tx_buffer_port1;
 static struct rte_eth_dev_tx_buffer *tx_buffer_port2;
 
-/* Expected sequence numbers for each direction (for fast-path optimization) */
-static uint32_t expected_seq_port1_to_port2 = 0;
-static uint32_t expected_seq_port2_to_port1 = 0;
+/* Expected sequence numbers for each direction (for fast-path optimization)
+ * Using atomic operations for thread-safe access */
+static rte_atomic32_t expected_seq_port1_to_port2 = RTE_ATOMIC32_INIT(0);
+static rte_atomic32_t expected_seq_port2_to_port1 = RTE_ATOMIC32_INIT(0);
 
-/* Statistics */
-struct __rte_cache_aligned app_stats {
-	uint64_t rx_port1_pkts;
-	uint64_t rx_port2_pkts;
-	uint64_t tx_port1_pkts;
-	uint64_t tx_port2_pkts;
+/* Rings for inter-thread communication */
+static struct rte_ring *rx_ring_port1;  /* RX port1 -> workers */
+static struct rte_ring *rx_ring_port2;  /* RX port2 -> workers */
+static struct rte_ring *tx_ring_port1;  /* Workers/reorder -> TX port1 */
+static struct rte_ring *tx_ring_port2;  /* Workers/reorder -> TX port2 */
+static struct rte_ring *reorder_ring_port1_to_port2;  /* Workers -> reorder thread (out-of-order) */
+static struct rte_ring *reorder_ring_port2_to_port1;  /* Workers -> reorder thread (out-of-order) */
+
+/* Thread arguments */
+struct rx_thread_args {
+	uint16_t port_id;
+	uint16_t dst_port;
+	struct rte_ring *ring_out;
+};
+
+struct worker_thread_args {
+	struct rte_ring *rx_ring_port1;
+	struct rte_ring *rx_ring_port2;
+	struct rte_ring *tx_ring_port1;
+	struct rte_ring *tx_ring_port2;
+	struct rte_ring *reorder_ring_p1_p2;  /* For out-of-order packets port1->port2 */
+	struct rte_ring *reorder_ring_p2_p1;  /* For out-of-order packets port2->port1 */
+};
+
+struct reorder_thread_args {
+	uint16_t dst_port;
+	struct rte_ring *ring_in;  /* Receives out-of-order packets from workers */
+	struct rte_ring *tx_ring;  /* Sends reordered packets to TX thread */
+	struct rte_reorder_buffer *reorder_buf;
+	rte_atomic32_t *expected_seq;
+};
+
+struct tx_thread_args {
+	uint16_t port_id;
+	struct rte_ring *ring_in;
+	struct rte_eth_dev_tx_buffer *tx_buf;
+};
+
+/* Per-lcore statistics */
+struct __rte_cache_aligned lcore_stats {
+	uint64_t rx_pkts;
+	uint64_t tx_pkts;
 	uint64_t macsec_pkts;
 	uint64_t non_macsec_pkts;
-	uint64_t in_order_pkts;      /* Packets transmitted via fast path */
+	uint64_t in_order_pkts;
 	uint64_t out_of_order_pkts;
 	uint64_t dropped_pkts;
 	uint64_t reordered_pkts;
+	uint64_t enqueue_failed;
+	uint64_t dequeue_failed;
 };
-static struct app_stats stats;
+static struct lcore_stats lcore_stats_array[RTE_MAX_LCORE];
 
 /* Port configuration */
 static struct rte_eth_conf port_conf = {
@@ -189,131 +231,327 @@ extract_macsec_pn(struct rte_mbuf *m, uint64_t *pn)
 }
 
 /**
- * Process received packets and insert into reorder buffer
- * port_id: port where packet was received
- * dst_port: port where packet should be transmitted
+ * RX thread - reads packets from a port and enqueues to ring
  */
-static void
-process_rx_packets(struct rte_mbuf **pkts, uint16_t nb_rx, uint16_t port_id, uint16_t dst_port)
+static int
+rx_thread(void *arg)
 {
-	uint16_t i;
-	uint64_t pn;
-	uint32_t seq;
-	int ret;
-	struct rte_reorder_buffer *reorder_buf;
-	struct rte_eth_dev_tx_buffer *tx_buf;
-	uint32_t *expected_seq;
+	struct rx_thread_args *args = (struct rx_thread_args *)arg;
+	uint16_t port_id = args->port_id;
+	struct rte_ring *ring_out = args->ring_out;
+	struct rte_mbuf *pkts[MAX_PKT_BURST];
+	uint16_t nb_rx;
+	unsigned int lcore_id = rte_lcore_id();
+	struct lcore_stats *lcore_stat = &lcore_stats_array[lcore_id];
 
-	/* Select appropriate reorder buffer, TX buffer, and expected sequence based on direction */
-	if (port_id == port1) {
-		reorder_buf = reorder_buffer_port1_to_port2;
-		tx_buf = tx_buffer_port2;
-		expected_seq = &expected_seq_port1_to_port2;
-	} else {
-		reorder_buf = reorder_buffer_port2_to_port1;
-		tx_buf = tx_buffer_port1;
-		expected_seq = &expected_seq_port2_to_port1;
-	}
+	RTE_LOG(INFO, MACSEC_REORDER, "RX thread started on lcore %u for port %u\n",
+		lcore_id, port_id);
 
-	for (i = 0; i < nb_rx; i++) {
-		struct rte_mbuf *pkt = pkts[i];
+	while (!force_quit) {
+		/* Read packets from port */
+		nb_rx = rte_eth_rx_burst(port_id, 0, pkts, MAX_PKT_BURST);
+		if (likely(nb_rx > 0)) {
+			lcore_stat->rx_pkts += nb_rx;
 
-		/* Check if MACsec packet */
-		if (is_macsec_packet(pkt)) {
-			stats.macsec_pkts++;
-
-			/* Extract packet number */
-			if (extract_macsec_pn(pkt, &pn)) {
-				seq = (uint32_t)pn;
-				*rte_reorder_seqn(pkt) = seq;
-
-				/* Fast path: Check if packet is in-order */
-				if (seq == *expected_seq) {
-					/* Packet is in-order - transmit directly (fast path) */
-					stats.in_order_pkts++;
-					ret = rte_eth_tx_buffer(dst_port, 0, tx_buf, pkt);
-					if (ret) {
-						if (dst_port == port1)
-							stats.tx_port1_pkts += ret;
-						else
-							stats.tx_port2_pkts += ret;
-					}
-					/* Update expected sequence number */
-					(*expected_seq)++;
-
-					/* Try to drain any buffered packets that are now ready */
-					struct rte_mbuf *drained_pkts[MAX_PKT_BURST];
-					unsigned int nb_drained = rte_reorder_drain(reorder_buf, drained_pkts, MAX_PKT_BURST);
-					if (nb_drained > 0) {
-						stats.reordered_pkts += nb_drained;
-						unsigned int j;
-						for (j = 0; j < nb_drained; j++) {
-							uint32_t drained_seq = *rte_reorder_seqn(drained_pkts[j]);
-							ret = rte_eth_tx_buffer(dst_port, 0, tx_buf, drained_pkts[j]);
-							if (ret) {
-								if (dst_port == port1)
-									stats.tx_port1_pkts += ret;
-								else
-									stats.tx_port2_pkts += ret;
-							}
-							/* Update expected sequence to the last drained packet + 1 */
-							*expected_seq = drained_seq + 1;
-						}
-					}
-				} else {
-					/* Packet is out-of-order - use reorder buffer (slow path) */
-					stats.out_of_order_pkts++;
-					ret = rte_reorder_insert(reorder_buf, pkt);
-					if (ret == -1) {
-						if (rte_errno == ERANGE) {
-							/* Packet too early - drop it */
-							RTE_LOG(DEBUG, MACSEC_REORDER,
-								"Packet with PN %" PRIu64 " too early (expected %u)\n",
-								pn, *expected_seq);
-							rte_pktmbuf_free(pkt);
-							stats.dropped_pkts++;
-						} else if (rte_errno == ENOSPC) {
-							/* Buffer full - drop packet */
-							RTE_LOG(DEBUG, MACSEC_REORDER,
-								"Reorder buffer full, dropping packet\n");
-							rte_pktmbuf_free(pkt);
-							stats.dropped_pkts++;
-						} else {
-							/* Other error */
-							RTE_LOG(ERR, MACSEC_REORDER,
-								"Error inserting packet into reorder buffer: %s\n",
-								rte_strerror(rte_errno));
-							rte_pktmbuf_free(pkt);
-							stats.dropped_pkts++;
-						}
-					}
-				}
-			} else {
-				/* Failed to extract PN - treat as non-MACsec */
-				RTE_LOG(DEBUG, MACSEC_REORDER,
-					"Failed to extract PN from MACsec packet\n");
-				stats.non_macsec_pkts++;
-				/* Forward immediately without reordering */
-				ret = rte_eth_tx_buffer(dst_port, 0, tx_buf, pkt);
-				if (ret) {
-					if (dst_port == port1)
-						stats.tx_port1_pkts += ret;
-					else
-						stats.tx_port2_pkts += ret;
-				}
-			}
-		} else {
-			/* Non-MACsec packet - forward immediately */
-			stats.non_macsec_pkts++;
-			ret = rte_eth_tx_buffer(dst_port, 0, tx_buf, pkt);
-			if (ret) {
-				if (dst_port == port1)
-					stats.tx_port1_pkts += ret;
-				else
-					stats.tx_port2_pkts += ret;
+			/* Enqueue to ring */
+			unsigned int nb_enq = rte_ring_enqueue_burst(ring_out,
+				(void *)pkts, nb_rx, NULL);
+			if (unlikely(nb_enq < nb_rx)) {
+				/* Free packets that couldn't be enqueued */
+				unsigned int i;
+				for (i = nb_enq; i < nb_rx; i++)
+					rte_pktmbuf_free(pkts[i]);
+				lcore_stat->enqueue_failed += (nb_rx - nb_enq);
+				lcore_stat->dropped_pkts += (nb_rx - nb_enq);
 			}
 		}
 	}
+
+	return 0;
+}
+
+/**
+ * Worker thread - processes packets from RX rings (fast path only)
+ * Multiple worker threads can run in parallel
+ */
+static int
+worker_thread(void *arg)
+{
+	struct worker_thread_args *args = (struct worker_thread_args *)arg;
+	struct rte_mbuf *pkts_rx1[MAX_PKT_BURST];
+	struct rte_mbuf *pkts_rx2[MAX_PKT_BURST];
+	unsigned int nb_deq1, nb_deq2;
+	unsigned int lcore_id = rte_lcore_id();
+	struct lcore_stats *lcore_stat = &lcore_stats_array[lcore_id];
+	uint16_t i;
+	uint64_t pn;
+	uint32_t seq;
+	uint32_t expected_seq_p1_p2, expected_seq_p2_p1;
+
+	RTE_LOG(INFO, MACSEC_REORDER, "Worker thread started on lcore %u\n", lcore_id);
+
+	while (!force_quit) {
+		/* Dequeue packets from RX rings */
+		nb_deq1 = rte_ring_dequeue_burst(args->rx_ring_port1,
+			(void *)pkts_rx1, MAX_PKT_BURST, NULL);
+		nb_deq2 = rte_ring_dequeue_burst(args->rx_ring_port2,
+			(void *)pkts_rx2, MAX_PKT_BURST, NULL);
+
+		if (nb_deq1 == 0 && nb_deq2 == 0)
+			continue;
+
+		/* Process packets from port1 -> port2 */
+		for (i = 0; i < nb_deq1; i++) {
+			struct rte_mbuf *pkt = pkts_rx1[i];
+
+			if (is_macsec_packet(pkt)) {
+				lcore_stat->macsec_pkts++;
+
+				if (extract_macsec_pn(pkt, &pn)) {
+					seq = (uint32_t)pn;
+					*rte_reorder_seqn(pkt) = seq;
+
+					/* Get current expected sequence (atomic read) */
+					expected_seq_p1_p2 = rte_atomic32_read(&expected_seq_port1_to_port2);
+
+					/* Fast path: Check if packet is in-order */
+					if (seq == expected_seq_p1_p2) {
+						lcore_stat->in_order_pkts++;
+						/* Update expected sequence (atomic) */
+						rte_atomic32_set(&expected_seq_port1_to_port2, seq + 1);
+						/* Enqueue directly to TX ring (bypass reorder buffer) */
+						if (rte_ring_enqueue(args->tx_ring_port2, pkt) != 0) {
+							rte_pktmbuf_free(pkt);
+							lcore_stat->enqueue_failed++;
+							lcore_stat->dropped_pkts++;
+						}
+					} else if (seq > expected_seq_p1_p2) {
+						/* Out-of-order (future packet) - send to reorder thread */
+						lcore_stat->out_of_order_pkts++;
+						if (rte_ring_enqueue(args->reorder_ring_p1_p2, pkt) != 0) {
+							rte_pktmbuf_free(pkt);
+							lcore_stat->enqueue_failed++;
+							lcore_stat->dropped_pkts++;
+						}
+					} else {
+						/* Packet too early (seq < expected) - drop it */
+						RTE_LOG(DEBUG, MACSEC_REORDER,
+							"Packet with seq %u too early (expected %u), dropping\n",
+							seq, expected_seq_p1_p2);
+						rte_pktmbuf_free(pkt);
+						lcore_stat->dropped_pkts++;
+					}
+				} else {
+					/* Failed to extract PN - forward as non-MACsec */
+					lcore_stat->non_macsec_pkts++;
+					if (rte_ring_enqueue(args->tx_ring_port2, pkt) != 0) {
+						rte_pktmbuf_free(pkt);
+						lcore_stat->enqueue_failed++;
+						lcore_stat->dropped_pkts++;
+					}
+				}
+			} else {
+				/* Non-MACsec packet - forward immediately */
+				lcore_stat->non_macsec_pkts++;
+				if (rte_ring_enqueue(args->tx_ring_port2, pkt) != 0) {
+					rte_pktmbuf_free(pkt);
+					lcore_stat->enqueue_failed++;
+					lcore_stat->dropped_pkts++;
+				}
+			}
+		}
+
+		/* Process packets from port2 -> port1 */
+		for (i = 0; i < nb_deq2; i++) {
+			struct rte_mbuf *pkt = pkts_rx2[i];
+
+			if (is_macsec_packet(pkt)) {
+				lcore_stat->macsec_pkts++;
+
+				if (extract_macsec_pn(pkt, &pn)) {
+					seq = (uint32_t)pn;
+					*rte_reorder_seqn(pkt) = seq;
+
+					/* Get current expected sequence (atomic read) */
+					expected_seq_p2_p1 = rte_atomic32_read(&expected_seq_port2_to_port1);
+
+					/* Fast path: Check if packet is in-order */
+					if (seq == expected_seq_p2_p1) {
+						lcore_stat->in_order_pkts++;
+						/* Update expected sequence (atomic) */
+						rte_atomic32_set(&expected_seq_port2_to_port1, seq + 1);
+						/* Enqueue directly to TX ring (bypass reorder buffer) */
+						if (rte_ring_enqueue(args->tx_ring_port1, pkt) != 0) {
+							rte_pktmbuf_free(pkt);
+							lcore_stat->enqueue_failed++;
+							lcore_stat->dropped_pkts++;
+						}
+					} else if (seq > expected_seq_p2_p1) {
+						/* Out-of-order (future packet) - send to reorder thread */
+						lcore_stat->out_of_order_pkts++;
+						if (rte_ring_enqueue(args->reorder_ring_p2_p1, pkt) != 0) {
+							rte_pktmbuf_free(pkt);
+							lcore_stat->enqueue_failed++;
+							lcore_stat->dropped_pkts++;
+						}
+					} else {
+						/* Packet too early (seq < expected) - drop it */
+						RTE_LOG(DEBUG, MACSEC_REORDER,
+							"Packet with seq %u too early (expected %u), dropping\n",
+							seq, expected_seq_p2_p1);
+						rte_pktmbuf_free(pkt);
+						lcore_stat->dropped_pkts++;
+					}
+				} else {
+					/* Failed to extract PN - forward as non-MACsec */
+					lcore_stat->non_macsec_pkts++;
+					if (rte_ring_enqueue(args->tx_ring_port1, pkt) != 0) {
+						rte_pktmbuf_free(pkt);
+						lcore_stat->enqueue_failed++;
+						lcore_stat->dropped_pkts++;
+					}
+				}
+			} else {
+				/* Non-MACsec packet - forward immediately */
+				lcore_stat->non_macsec_pkts++;
+				if (rte_ring_enqueue(args->tx_ring_port1, pkt) != 0) {
+					rte_pktmbuf_free(pkt);
+					lcore_stat->enqueue_failed++;
+					lcore_stat->dropped_pkts++;
+				}
+			}
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Reorder thread - handles out-of-order packets and reorder buffer operations
+ * One thread per direction (required for thread-safe reorder buffer access)
+ */
+static int
+reorder_thread(void *arg)
+{
+	struct reorder_thread_args *args = (struct reorder_thread_args *)arg;
+	struct rte_mbuf *pkts_in[MAX_PKT_BURST];
+	struct rte_mbuf *pkts_drained[MAX_PKT_BURST];
+	unsigned int nb_deq, nb_drained;
+	unsigned int i;
+	int ret;
+	uint32_t seq, drained_seq;
+	unsigned int lcore_id = rte_lcore_id();
+	struct lcore_stats *lcore_stat = &lcore_stats_array[lcore_id];
+	uint32_t expected_seq;
+
+	RTE_LOG(INFO, MACSEC_REORDER, "Reorder thread started on lcore %u for port %u\n",
+		lcore_id, args->dst_port);
+
+	while (!force_quit) {
+		/* Dequeue out-of-order packets from workers (non-blocking) */
+		nb_deq = rte_ring_dequeue_burst(args->ring_in, (void *)pkts_in,
+			MAX_PKT_BURST, NULL);
+
+		if (nb_deq > 0) {
+			for (i = 0; i < nb_deq; i++) {
+				struct rte_mbuf *pkt = pkts_in[i];
+				seq = *rte_reorder_seqn(pkt);
+
+				/* Insert into reorder buffer */
+				ret = rte_reorder_insert(args->reorder_buf, pkt);
+				if (ret == -1) {
+					if (rte_errno == ERANGE || rte_errno == ENOSPC) {
+						rte_pktmbuf_free(pkt);
+						lcore_stat->dropped_pkts++;
+					} else {
+						RTE_LOG(ERR, MACSEC_REORDER,
+							"Error inserting packet: %s\n",
+							rte_strerror(rte_errno));
+						rte_pktmbuf_free(pkt);
+						lcore_stat->dropped_pkts++;
+					}
+				}
+			}
+		}
+
+		/* Always try to drain packets from reorder buffer
+		 * (expected_seq may have been updated by worker threads) */
+		nb_drained = rte_reorder_drain(args->reorder_buf, pkts_drained, MAX_PKT_BURST);
+		if (nb_drained > 0) {
+			lcore_stat->reordered_pkts += nb_drained;
+			for (i = 0; i < nb_drained; i++) {
+				drained_seq = *rte_reorder_seqn(pkts_drained[i]);
+				if (rte_ring_enqueue(args->tx_ring, pkts_drained[i]) != 0) {
+					rte_pktmbuf_free(pkts_drained[i]);
+					lcore_stat->enqueue_failed++;
+					lcore_stat->dropped_pkts++;
+				}
+				/* Update expected sequence (atomic) */
+				rte_atomic32_set(args->expected_seq, drained_seq + 1);
+			}
+		}
+
+		/* If no packets to process, yield to avoid busy-waiting */
+		if (nb_deq == 0 && nb_drained == 0)
+			rte_pause();
+	}
+
+	return 0;
+}
+
+/**
+ * TX thread - drains reorder buffer and transmits packets
+ */
+static int
+tx_thread(void *arg)
+{
+	struct tx_thread_args *args = (struct tx_thread_args *)arg;
+	uint16_t port_id = args->port_id;
+	struct rte_ring *ring_in = args->ring_in;
+	struct rte_eth_dev_tx_buffer *tx_buf = args->tx_buf;
+	struct rte_mbuf *pkts_ring[MAX_PKT_BURST];
+	unsigned int nb_deq;
+	unsigned int i;
+	int sent;
+	uint64_t prev_tsc, cur_tsc, diff_tsc;
+	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S *
+			BURST_TX_DRAIN_US;
+	unsigned int lcore_id = rte_lcore_id();
+	struct lcore_stats *lcore_stat = &lcore_stats_array[lcore_id];
+
+	prev_tsc = rte_rdtsc();
+
+	RTE_LOG(INFO, MACSEC_REORDER, "TX thread started on lcore %u for port %u\n",
+		lcore_id, port_id);
+
+	while (!force_quit) {
+		cur_tsc = rte_rdtsc();
+		diff_tsc = cur_tsc - prev_tsc;
+
+		/* Drain TX buffer periodically */
+		if (unlikely(diff_tsc > drain_tsc)) {
+			sent = rte_eth_tx_buffer_flush(port_id, 0, tx_buf);
+			if (sent) {
+				lcore_stat->tx_pkts += sent;
+			}
+			prev_tsc = cur_tsc;
+		}
+
+			/* Dequeue packets from ring */
+		nb_deq = rte_ring_dequeue_burst(ring_in, (void *)pkts_ring,
+			MAX_PKT_BURST, NULL);
+
+		if (nb_deq > 0) {
+			/* Transmit packets */
+			for (i = 0; i < nb_deq; i++) {
+				sent = rte_eth_tx_buffer(port_id, 0, tx_buf, pkts_ring[i]);
+				if (sent)
+					lcore_stat->tx_pkts += sent;
+			}
+		}
+	}
+
+	return 0;
 }
 
 /**
@@ -322,135 +560,80 @@ process_rx_packets(struct rte_mbuf **pkts, uint16_t nb_rx, uint16_t port_id, uin
 static void print_stats(void);
 
 /**
- * Drain reorder buffer and transmit packets
- * This is called periodically to drain any buffered packets that became ready
+ * Statistics thread - aggregates and prints statistics
  */
-static void
-drain_and_transmit(void)
+static int
+stats_thread(__rte_unused void *arg)
 {
-	struct rte_mbuf *pkts[MAX_PKT_BURST];
-	unsigned int nb_drained;
-	unsigned int i;
-	int sent;
-	uint32_t seq;
-
-	/* Drain reordered packets from port1->port2 direction */
-	nb_drained = rte_reorder_drain(reorder_buffer_port1_to_port2, pkts, MAX_PKT_BURST);
-	if (nb_drained > 0) {
-		stats.reordered_pkts += nb_drained;
-		for (i = 0; i < nb_drained; i++) {
-			seq = *rte_reorder_seqn(pkts[i]);
-			sent = rte_eth_tx_buffer(port2, 0, tx_buffer_port2, pkts[i]);
-			if (sent)
-				stats.tx_port2_pkts += sent;
-			/* Update expected sequence to the last drained packet + 1 */
-			expected_seq_port1_to_port2 = seq + 1;
-		}
-	}
-
-	/* Drain reordered packets from port2->port1 direction */
-	nb_drained = rte_reorder_drain(reorder_buffer_port2_to_port1, pkts, MAX_PKT_BURST);
-	if (nb_drained > 0) {
-		stats.reordered_pkts += nb_drained;
-		for (i = 0; i < nb_drained; i++) {
-			seq = *rte_reorder_seqn(pkts[i]);
-			sent = rte_eth_tx_buffer(port1, 0, tx_buffer_port1, pkts[i]);
-			if (sent)
-				stats.tx_port1_pkts += sent;
-			/* Update expected sequence to the last drained packet + 1 */
-			expected_seq_port2_to_port1 = seq + 1;
-		}
-	}
-}
-
-/**
- * Main processing loop
- */
-static void
-main_loop(void)
-{
-	struct rte_mbuf *pkts_burst1[MAX_PKT_BURST];
-	struct rte_mbuf *pkts_burst2[MAX_PKT_BURST];
-	uint16_t nb_rx1, nb_rx2;
-	uint64_t prev_tsc, cur_tsc, diff_tsc, timer_tsc;
-	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S *
-			BURST_TX_DRAIN_US;
+	uint64_t prev_tsc, cur_tsc, timer_tsc;
 	uint64_t timer_period_cycles = timer_period * rte_get_timer_hz();
+	unsigned int lcore_id;
 
 	prev_tsc = rte_rdtsc();
 	timer_tsc = 0;
 
-	RTE_LOG(INFO, MACSEC_REORDER, "Entering main loop on lcore %u\n",
+	RTE_LOG(INFO, MACSEC_REORDER, "Stats thread started on lcore %u\n",
 		rte_lcore_id());
-	RTE_LOG(INFO, MACSEC_REORDER, "Port 1: %u, Port 2: %u\n",
-		port1, port2);
 
 	while (!force_quit) {
 		cur_tsc = rte_rdtsc();
+		uint64_t diff_tsc = cur_tsc - prev_tsc;
 
-		/* Drain TX buffers periodically */
-		diff_tsc = cur_tsc - prev_tsc;
-		if (unlikely(diff_tsc > drain_tsc)) {
-			int sent1 = rte_eth_tx_buffer_flush(port1, 0, tx_buffer_port1);
-			if (sent1)
-				stats.tx_port1_pkts += sent1;
-
-			int sent2 = rte_eth_tx_buffer_flush(port2, 0, tx_buffer_port2);
-			if (sent2)
-				stats.tx_port2_pkts += sent2;
-
-			/* Print statistics periodically */
-			timer_tsc += diff_tsc;
-			if (unlikely(timer_tsc >= timer_period_cycles)) {
-				print_stats();
-				timer_tsc = 0;
-			}
-
-			prev_tsc = cur_tsc;
+		timer_tsc += diff_tsc;
+		if (unlikely(timer_tsc >= timer_period_cycles)) {
+			print_stats();
+			timer_tsc = 0;
 		}
 
-		/* Read packets from port 1 -> forward to port 2 */
-		nb_rx1 = rte_eth_rx_burst(port1, 0, pkts_burst1, MAX_PKT_BURST);
-		if (likely(nb_rx1 > 0)) {
-			stats.rx_port1_pkts += nb_rx1;
-			process_rx_packets(pkts_burst1, nb_rx1, port1, port2);
-		}
-
-		/* Read packets from port 2 -> forward to port 1 */
-		nb_rx2 = rte_eth_rx_burst(port2, 0, pkts_burst2, MAX_PKT_BURST);
-		if (likely(nb_rx2 > 0)) {
-			stats.rx_port2_pkts += nb_rx2;
-			process_rx_packets(pkts_burst2, nb_rx2, port2, port1);
-		}
-
-		/* Drain reorder buffers and transmit */
-		drain_and_transmit();
+		prev_tsc = cur_tsc;
+		rte_delay_us_sleep(100000); /* Sleep 100ms */
 	}
+
+	return 0;
 }
 
 /**
- * Print statistics
+ * Print statistics - aggregates from all lcores
  */
 static void
 print_stats(void)
 {
 	const char clr[] = { 27, '[', '2', 'J', '\0' };
 	const char topLeft[] = { 27, '[', '1', ';', '1', 'H', '\0' };
+	uint64_t total_rx = 0, total_tx = 0;
+	uint64_t total_macsec = 0, total_non_macsec = 0;
+	uint64_t total_in_order = 0, total_out_of_order = 0;
+	uint64_t total_dropped = 0, total_reordered = 0;
+	uint64_t total_enq_failed = 0;
+	unsigned int lcore_id;
+
+	/* Aggregate statistics from all lcores */
+	RTE_LCORE_FOREACH(lcore_id) {
+		struct lcore_stats *stat = &lcore_stats_array[lcore_id];
+		total_rx += stat->rx_pkts;
+		total_tx += stat->tx_pkts;
+		total_macsec += stat->macsec_pkts;
+		total_non_macsec += stat->non_macsec_pkts;
+		total_in_order += stat->in_order_pkts;
+		total_out_of_order += stat->out_of_order_pkts;
+		total_dropped += stat->dropped_pkts;
+		total_reordered += stat->reordered_pkts;
+		total_enq_failed += stat->enqueue_failed;
+	}
 
 	/* Clear screen and move to top left */
 	printf("%s%s", clr, topLeft);
 
 	printf("\n============== MACsec Reorder Statistics ==============\n");
-	printf("RX Port 1 packets:        %20" PRIu64 "\n", stats.rx_port1_pkts);
-	printf("RX Port 2 packets:        %20" PRIu64 "\n", stats.rx_port2_pkts);
-	printf("TX Port 1 packets:        %20" PRIu64 "\n", stats.tx_port1_pkts);
-	printf("TX Port 2 packets:        %20" PRIu64 "\n", stats.tx_port2_pkts);
-	printf("MACsec packets:           %20" PRIu64 "\n", stats.macsec_pkts);
-	printf("Non-MACsec packets:       %20" PRIu64 "\n", stats.non_macsec_pkts);
-	printf("In-order packets (fast):  %20" PRIu64 "\n", stats.in_order_pkts);
-	printf("Out-of-order packets:     %20" PRIu64 "\n", stats.out_of_order_pkts);
-	printf("Reordered packets:        %20" PRIu64 "\n", stats.reordered_pkts);
-	printf("Dropped packets:          %20" PRIu64 "\n", stats.dropped_pkts);
+	printf("Total RX packets:          %20" PRIu64 "\n", total_rx);
+	printf("Total TX packets:          %20" PRIu64 "\n", total_tx);
+	printf("MACsec packets:            %20" PRIu64 "\n", total_macsec);
+	printf("Non-MACsec packets:        %20" PRIu64 "\n", total_non_macsec);
+	printf("In-order packets (fast):   %20" PRIu64 "\n", total_in_order);
+	printf("Out-of-order packets:      %20" PRIu64 "\n", total_out_of_order);
+	printf("Reordered packets:         %20" PRIu64 "\n", total_reordered);
+	printf("Dropped packets:           %20" PRIu64 "\n", total_dropped);
+	printf("Enqueue failed:            %20" PRIu64 "\n", total_enq_failed);
 	printf("========================================================\n");
 
 	fflush(stdout);
@@ -800,11 +983,240 @@ main(int argc, char **argv)
 	uint32_t port_mask = (1 << port1) | (1 << port2);
 	check_all_ports_link_status(port_mask);
 
-	/* Main loop */
-	printf("\nStarting packet processing...\n");
+	/* Create rings for inter-thread communication */
+	rx_ring_port1 = rte_ring_create("rx_ring_port1", RING_SIZE, rte_socket_id(),
+		RING_F_SP_ENQ | RING_F_SC_DEQ);
+	if (rx_ring_port1 == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create RX ring for port1: %s\n",
+			rte_strerror(rte_errno));
 
-	/* Run main loop directly - it has its own while loop */
-	main_loop();
+	rx_ring_port2 = rte_ring_create("rx_ring_port2", RING_SIZE, rte_socket_id(),
+		RING_F_SP_ENQ | RING_F_SC_DEQ);
+	if (rx_ring_port2 == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create RX ring for port2: %s\n",
+			rte_strerror(rte_errno));
+
+	tx_ring_port1 = rte_ring_create("tx_ring_port1", RING_SIZE, rte_socket_id(),
+		RING_F_SP_ENQ | RING_F_SC_DEQ);
+	if (tx_ring_port1 == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create TX ring for port1: %s\n",
+			rte_strerror(rte_errno));
+
+	tx_ring_port2 = rte_ring_create("tx_ring_port2", RING_SIZE, rte_socket_id(),
+		RING_F_SP_ENQ | RING_F_SC_DEQ);
+	if (tx_ring_port2 == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create TX ring for port2: %s\n",
+			rte_strerror(rte_errno));
+
+	/* Create reorder rings for out-of-order packets */
+	reorder_ring_port1_to_port2 = rte_ring_create("reorder_ring_p1_p2", RING_SIZE,
+		rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+	if (reorder_ring_port1_to_port2 == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create reorder ring port1->port2: %s\n",
+			rte_strerror(rte_errno));
+
+	reorder_ring_port2_to_port1 = rte_ring_create("reorder_ring_p2_p1", RING_SIZE,
+		rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+	if (reorder_ring_port2_to_port1 == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create reorder ring port2->port1: %s\n",
+			rte_strerror(rte_errno));
+
+	/* Check if we have enough cores */
+	unsigned int nb_lcores = rte_lcore_count();
+	unsigned int required_cores = 9; /* 1 main + 2 RX + 1 worker + 2 reorder + 2 TX + 1 stats */
+	unsigned int nb_worker_cores_available = 0;
+	
+	if (nb_lcores >= required_cores) {
+		/* Calculate available worker cores (total - main - 7 fixed cores) */
+		nb_worker_cores_available = nb_lcores - 1 - 7; /* -1 for main, -7 for fixed */
+	} else {
+		rte_exit(EXIT_FAILURE,
+			"Error: Need at least %u cores total (found %u)\n"
+			"  Breakdown:\n"
+			"  - 1 core for main thread\n"
+			"  - 2 cores for RX threads (one per port)\n"
+			"  - 2 cores for reorder threads (one per direction)\n"
+			"  - 2 cores for TX threads (one per port)\n"
+			"  - 1 core for stats thread\n"
+			"  - 1+ cores for worker threads (scales with available cores)\n"
+			"  = %u cores minimum\n",
+			required_cores, nb_lcores, required_cores);
+	}
+	
+	if (nb_worker_cores_available == 0) {
+		rte_exit(EXIT_FAILURE,
+			"Error: No cores available for worker threads.\n"
+			"  With %u cores total, all worker cores are used for fixed threads.\n"
+			"  Need at least %u cores total to have worker threads.\n",
+			nb_lcores, required_cores);
+	}
+
+	/* Initialize thread arguments */
+	struct rx_thread_args rx_args_port1 = {
+		.port_id = port1,
+		.dst_port = port2,
+		.ring_out = rx_ring_port1,
+	};
+
+	struct rx_thread_args rx_args_port2 = {
+		.port_id = port2,
+		.dst_port = port1,
+		.ring_out = rx_ring_port2,
+	};
+
+	struct worker_thread_args worker_args = {
+		.rx_ring_port1 = rx_ring_port1,
+		.rx_ring_port2 = rx_ring_port2,
+		.tx_ring_port1 = tx_ring_port1,
+		.tx_ring_port2 = tx_ring_port2,
+		.reorder_ring_p1_p2 = reorder_ring_port1_to_port2,
+		.reorder_ring_p2_p1 = reorder_ring_port2_to_port1,
+	};
+
+	struct reorder_thread_args reorder_args_p1_p2 = {
+		.dst_port = port2,
+		.ring_in = reorder_ring_port1_to_port2,
+		.tx_ring = tx_ring_port2,
+		.reorder_buf = reorder_buffer_port1_to_port2,
+		.expected_seq = &expected_seq_port1_to_port2,
+	};
+
+	struct reorder_thread_args reorder_args_p2_p1 = {
+		.dst_port = port1,
+		.ring_in = reorder_ring_port2_to_port1,
+		.tx_ring = tx_ring_port1,
+		.reorder_buf = reorder_buffer_port2_to_port1,
+		.expected_seq = &expected_seq_port2_to_port1,
+	};
+
+	struct tx_thread_args tx_args_port1 = {
+		.port_id = port1,
+		.ring_in = tx_ring_port1,
+		.tx_buf = tx_buffer_port1,
+	};
+
+	struct tx_thread_args tx_args_port2 = {
+		.port_id = port2,
+		.ring_in = tx_ring_port2,
+		.tx_buf = tx_buffer_port2,
+	};
+
+	/* Launch threads on available lcores */
+	unsigned int lcore_id;
+	unsigned int rx_lcore_port1 = 0, rx_lcore_port2 = 0;
+	unsigned int reorder_lcore_p1_p2 = 0, reorder_lcore_p2_p1 = 0;
+	unsigned int tx_lcore_port1 = 0, tx_lcore_port2 = 0;
+	unsigned int stats_lcore = 0;
+	unsigned int lcore_idx = 0;
+	unsigned int worker_lcores[RTE_MAX_LCORE];
+	unsigned int nb_workers_launched = 0;
+
+	/* Assign fixed lcores - skip main lcore
+	 * We need: 2 RX + 2 reorder + 2 TX + 1 stats = 7 fixed cores
+	 * Remaining cores go to worker threads (need at least 1) */
+	RTE_LCORE_FOREACH_WORKER(lcore_id) {
+		if (lcore_idx < 7) {
+			/* Assign fixed function cores */
+			switch (lcore_idx) {
+			case 0:
+				rx_lcore_port1 = lcore_id;
+				break;
+			case 1:
+				rx_lcore_port2 = lcore_id;
+				break;
+			case 2:
+				reorder_lcore_p1_p2 = lcore_id;
+				break;
+			case 3:
+				reorder_lcore_p2_p1 = lcore_id;
+				break;
+			case 4:
+				tx_lcore_port1 = lcore_id;
+				break;
+			case 5:
+				tx_lcore_port2 = lcore_id;
+				break;
+			case 6:
+				stats_lcore = lcore_id;
+				break;
+			}
+		} else {
+			/* Remaining cores are for worker threads */
+			if (nb_workers_launched < RTE_MAX_LCORE) {
+				worker_lcores[nb_workers_launched++] = lcore_id;
+			}
+		}
+		lcore_idx++;
+	}
+
+	/* Launch RX thread for port1 */
+	if (rx_lcore_port1 > 0) {
+		printf("Launching RX thread for port %u on lcore %u\n",
+			port1, rx_lcore_port1);
+		rte_eal_remote_launch(rx_thread, &rx_args_port1, rx_lcore_port1);
+	}
+
+	/* Launch RX thread for port2 */
+	if (rx_lcore_port2 > 0) {
+		printf("Launching RX thread for port %u on lcore %u\n",
+			port2, rx_lcore_port2);
+		rte_eal_remote_launch(rx_thread, &rx_args_port2, rx_lcore_port2);
+	}
+
+	/* Launch multiple worker threads */
+	if (nb_workers_launched == 0) {
+		/* If no worker cores were assigned (shouldn't happen with 7+ cores),
+		 * we need at least one worker thread. Use the stats core if needed. */
+		rte_exit(EXIT_FAILURE,
+			"Error: No worker threads available. Need at least 7 cores.\n");
+	}
+	printf("Launching %u worker thread(s):\n", nb_workers_launched);
+	for (unsigned int i = 0; i < nb_workers_launched; i++) {
+		printf("  Worker thread %u on lcore %u\n", i, worker_lcores[i]);
+		rte_eal_remote_launch(worker_thread, &worker_args, worker_lcores[i]);
+	}
+
+	/* Launch reorder thread for port1->port2 */
+	if (reorder_lcore_p1_p2 > 0) {
+		printf("Launching reorder thread for port %u->%u on lcore %u\n",
+			port1, port2, reorder_lcore_p1_p2);
+		rte_eal_remote_launch(reorder_thread, &reorder_args_p1_p2, reorder_lcore_p1_p2);
+	}
+
+	/* Launch reorder thread for port2->port1 */
+	if (reorder_lcore_p2_p1 > 0) {
+		printf("Launching reorder thread for port %u->%u on lcore %u\n",
+			port2, port1, reorder_lcore_p2_p1);
+		rte_eal_remote_launch(reorder_thread, &reorder_args_p2_p1, reorder_lcore_p2_p1);
+	}
+
+	/* Launch TX thread for port1 */
+	if (tx_lcore_port1 > 0) {
+		printf("Launching TX thread for port %u on lcore %u\n",
+			port1, tx_lcore_port1);
+		rte_eal_remote_launch(tx_thread, &tx_args_port1, tx_lcore_port1);
+	}
+
+	/* Launch TX thread for port2 */
+	if (tx_lcore_port2 > 0) {
+		printf("Launching TX thread for port %u on lcore %u\n",
+			port2, tx_lcore_port2);
+		rte_eal_remote_launch(tx_thread, &tx_args_port2, tx_lcore_port2);
+	}
+
+	/* Launch stats thread */
+	if (stats_lcore > 0) {
+		printf("Launching stats thread on lcore %u\n", stats_lcore);
+		rte_eal_remote_launch(stats_thread, NULL, stats_lcore);
+	}
+
+	printf("\nAll threads launched. Starting packet processing...\n");
+
+	/* Wait for all worker threads */
+	RTE_LCORE_FOREACH_WORKER(lcore_id) {
+		if (rte_eal_wait_lcore(lcore_id) < 0)
+			ret = -1;
+	}
 
 	/* Print final statistics */
 	print_stats();
