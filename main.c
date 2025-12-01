@@ -91,6 +91,9 @@ static uint64_t timer_period = 10;
 /* Promiscuous mode flag */
 static int promiscuous_on = 0;
 
+/* Stats thread enabled flag */
+static int stats_thread_enabled = 1;
+
 /* Mempool for mbufs */
 static struct rte_mempool *mbuf_pool;
 
@@ -645,7 +648,10 @@ print_stats(void)
 static void
 signal_handler(int signum)
 {
-	if (signum == SIGINT || signum == SIGTERM) {
+	if (signum == SIGUSR1) {
+		/* Print statistics on demand without exiting */
+		print_stats();
+	} else if (signum == SIGINT || signum == SIGTERM) {
 		printf("\n\nSignal %d received, preparing to exit...\n", signum);
 		force_quit = true;
 	}
@@ -657,11 +663,12 @@ signal_handler(int signum)
 static void
 print_usage(const char *prgname)
 {
-	printf("%s [EAL options] -- -p PORTMASK [-P] [-T PERIOD]\n"
+	printf("%s [EAL options] -- -p PORTMASK [-P] [-T PERIOD] [-S]\n"
 		"  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
 		"              (must include exactly 2 ports)\n"
 		"  -P: Enable promiscuous mode\n"
-		"  -T PERIOD: statistics refresh period in seconds (0 to disable, default 10)\n",
+		"  -T PERIOD: statistics refresh period in seconds (0 to disable, default 10)\n"
+		"  -S: Disable statistics thread (reduces minimum core requirement to 8)\n",
 		prgname);
 }
 
@@ -695,7 +702,7 @@ parse_args(int argc, char **argv)
 
 	argvopt = argv;
 
-	while ((opt = getopt(argc, argvopt, "p:PT:")) != EOF) {
+	while ((opt = getopt(argc, argvopt, "p:PT:S")) != EOF) {
 		switch (opt) {
 		case 'p':
 			portmask = parse_portmask(optarg);
@@ -717,6 +724,9 @@ parse_args(int argc, char **argv)
 			timer_period = tmp;
 			break;
 		}
+		case 'S':
+			stats_thread_enabled = 0;
+			break;
 		default:
 			print_usage(prgname);
 			return -1;
@@ -766,6 +776,7 @@ parse_args(int argc, char **argv)
 	printf("  Port 1: %u (receives -> forwards to Port 2)\n", port1);
 	printf("  Port 2: %u (receives -> forwards to Port 1)\n", port2);
 	printf("  Promiscuous mode: %s\n", promiscuous_on ? "enabled" : "disabled");
+	printf("  Stats thread: %s\n", stats_thread_enabled ? "enabled" : "disabled");
 
 	return optind - 1;
 }
@@ -862,6 +873,7 @@ main(int argc, char **argv)
 	force_quit = false;
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
+	signal(SIGUSR1, signal_handler);
 
 	/* Parse application arguments */
 	ret = parse_args(argc, argv);
@@ -1023,12 +1035,15 @@ main(int argc, char **argv)
 
 	/* Check if we have enough cores */
 	unsigned int nb_lcores = rte_lcore_count();
-	unsigned int required_cores = 9; /* 1 main + 2 RX + 1 worker + 2 reorder + 2 TX + 1 stats */
+	unsigned int fixed_cores = 6; /* 2 RX + 2 reorder + 2 TX */
+	if (stats_thread_enabled)
+		fixed_cores++; /* +1 for stats thread */
+	unsigned int required_cores = 1 + fixed_cores + 1; /* main + fixed + at least 1 worker */
 	unsigned int nb_worker_cores_available = 0;
 	
 	if (nb_lcores >= required_cores) {
-		/* Calculate available worker cores (total - main - 7 fixed cores) */
-		nb_worker_cores_available = nb_lcores - 1 - 7; /* -1 for main, -7 for fixed */
+		/* Calculate available worker cores (total - main - fixed cores) */
+		nb_worker_cores_available = nb_lcores - 1 - fixed_cores; /* -1 for main */
 	} else {
 		rte_exit(EXIT_FAILURE,
 			"Error: Need at least %u cores total (found %u)\n"
@@ -1037,17 +1052,21 @@ main(int argc, char **argv)
 			"  - 2 cores for RX threads (one per port)\n"
 			"  - 2 cores for reorder threads (one per direction)\n"
 			"  - 2 cores for TX threads (one per port)\n"
-			"  - 1 core for stats thread\n"
+			"%s"
 			"  - 1+ cores for worker threads (scales with available cores)\n"
-			"  = %u cores minimum\n",
-			required_cores, nb_lcores, required_cores);
+			"  = %u cores minimum\n"
+			"  (Use -S to disable stats thread and reduce requirement to 8 cores)\n",
+			required_cores, nb_lcores,
+			stats_thread_enabled ? "  - 1 core for stats thread\n" : "",
+			required_cores);
 	}
 	
 	if (nb_worker_cores_available == 0) {
 		rte_exit(EXIT_FAILURE,
 			"Error: No cores available for worker threads.\n"
 			"  With %u cores total, all worker cores are used for fixed threads.\n"
-			"  Need at least %u cores total to have worker threads.\n",
+			"  Need at least %u cores total to have worker threads.\n"
+			"  (Use -S to disable stats thread and reduce requirement to 8 cores)\n",
 			nb_lcores, required_cores);
 	}
 
@@ -1112,10 +1131,10 @@ main(int argc, char **argv)
 	unsigned int nb_workers_launched = 0;
 
 	/* Assign fixed lcores - skip main lcore
-	 * We need: 2 RX + 2 reorder + 2 TX + 1 stats = 7 fixed cores
+	 * We need: 2 RX + 2 reorder + 2 TX + (1 stats if enabled) = 6 or 7 fixed cores
 	 * Remaining cores go to worker threads (need at least 1) */
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
-		if (lcore_idx < 7) {
+		if (lcore_idx < fixed_cores) {
 			/* Assign fixed function cores */
 			switch (lcore_idx) {
 			case 0:
@@ -1137,7 +1156,8 @@ main(int argc, char **argv)
 				tx_lcore_port2 = lcore_id;
 				break;
 			case 6:
-				stats_lcore = lcore_id;
+				if (stats_thread_enabled)
+					stats_lcore = lcore_id;
 				break;
 			}
 		} else {
@@ -1204,10 +1224,12 @@ main(int argc, char **argv)
 		rte_eal_remote_launch(tx_thread, &tx_args_port2, tx_lcore_port2);
 	}
 
-	/* Launch stats thread */
-	if (stats_lcore > 0) {
+	/* Launch stats thread (if enabled) */
+	if (stats_thread_enabled && stats_lcore > 0) {
 		printf("Launching stats thread on lcore %u\n", stats_lcore);
 		rte_eal_remote_launch(stats_thread, NULL, stats_lcore);
+	} else if (!stats_thread_enabled) {
+		printf("Stats thread disabled (use -S to disable, or remove -S to enable)\n");
 	}
 
 	printf("\nAll threads launched. Starting packet processing...\n");
