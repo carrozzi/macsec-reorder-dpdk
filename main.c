@@ -9,6 +9,13 @@
  * Packet Number (PN) from the MACsec SecTAG header. It acts as a transparent
  * bump-in-the-wire between two network segments.
  *
+ * USE CASE:
+ * When MACsec packets traverse network paths that may cause reordering (e.g.,
+ * multi-path routing, asymmetric links, or network devices that buffer/delay
+ * packets), the receiving MACsec endpoint may reject packets due to anti-replay
+ * protection. This application sits inline and reorders packets before they
+ * reach the MACsec receiver, ensuring packets arrive in sequence order.
+ *
  * ARCHITECTURE OVERVIEW:
  * 
  *   Port 1 (RX)                                              Port 2 (TX)
@@ -35,6 +42,20 @@
  * - rte_reorder_buffer: DPDK's built-in packet reordering library
  * - rte_ring: Lock-free FIFO queues for inter-thread communication
  * - expected_seq: Tracks the next expected sequence number per direction
+ *
+ * IMPORTANT NOTES ON DOWNSTREAM MACSEC:
+ * Even when this application correctly reorders packets, you may still see
+ * packet loss at the receiving MACsec endpoint. This can happen if:
+ * 
+ * 1. The MACsec receiver has a small anti-replay window that has already
+ *    advanced past delayed packets by the time they arrive (even reordered).
+ * 
+ * 2. Software MACsec implementations (e.g., Linux macsec) often have fixed,
+ *    small replay windows. Hardware MACsec on network switches typically
+ *    handles this better with larger/configurable windows.
+ * 
+ * 3. If you see loss matching your delay rate (e.g., 5% delay = ~5% loss),
+ *    check the receiving MACsec device's replay window configuration.
  */
 
 #include <stdio.h>
@@ -74,6 +95,32 @@
  * =============================================================================
  * CONSTANTS AND CONFIGURATION
  * =============================================================================
+ * 
+ * TUNING GUIDE:
+ * The parameters below control the reordering behavior. Adjust them based on
+ * your network characteristics:
+ * 
+ * 1. REORDER_BUFFER_SIZE - How many packets can be held waiting for reordering
+ *    - Increase if: High packet rates AND long delays (e.g., 100K+ pps with 500ms delay)
+ *    - Formula: buffer_size > packet_rate * max_delay * delay_percentage
+ *    - Example: 50K pps * 0.5s * 0.30 = 7,500 packets minimum for 30% delay
+ *    - Current: 64K packets (handles ~100K pps with 500ms delay at 10% rate)
+ * 
+ * 2. REORDER_TIMEOUT_US - How long to wait for a missing packet before skipping
+ *    - Must be LONGER than your maximum expected packet delay
+ *    - Too short: Packets arrive after timeout, get dropped as "late"
+ *    - Too long: Throughput suffers when packets are truly lost
+ *    - Current: 500ms (works for delays up to ~400ms)
+ *    - For 350-500ms delays, increase to 600,000-700,000 (600-700ms)
+ * 
+ * 3. RING_SIZE - Inter-thread communication buffer size
+ *    - Should be at least 2x REORDER_BUFFER_SIZE
+ *    - Increase if you see "Enqueue failed" in stats
+ * 
+ * 4. Delay Rate vs Throughput:
+ *    - Low delay rates (1-10%): Full throughput achievable
+ *    - High delay rates (>20%): Throughput limited by timeout cycles
+ *    - At 30%+ delay rate with high packet rates, expect reduced throughput
  */
 
 /* MACsec ethertype (IEEE 802.1AE) - identifies MACsec-encapsulated frames */
@@ -86,17 +133,63 @@
 #define BURST_TX_DRAIN_US 100      /* TX buffer drain interval (microseconds) */
 #define MEMPOOL_CACHE_SIZE 256     /* Per-core mbuf cache size */
 
-/* Reorder buffer configuration */
-#define REORDER_BUFFER_SIZE 8192   /* Max packets the reorder buffer can hold */
-#define RING_SIZE 16384            /* Size of inter-thread rings */
+/*
+ * REORDER_BUFFER_SIZE: Maximum packets the reorder buffer can hold.
+ * 
+ * This determines how many "out-of-order" packets can be buffered while
+ * waiting for missing packets to arrive. The buffer uses a sliding window
+ * based on sequence numbers.
+ * 
+ * WHEN TO INCREASE:
+ * - High packet rates (>50K pps) combined with long delays (>200ms)
+ * - Seeing "INSERT FAILED: buffer full" in debug logs
+ * - High percentage of delayed packets (>10%)
+ * 
+ * WHEN TO DECREASE:
+ * - Memory constrained systems
+ * - Low packet rates or short delays
+ * 
+ * Memory usage: ~200 bytes per slot (pointers + metadata)
+ * Current 64K = ~13MB per reorder buffer (2 buffers total = ~26MB)
+ */
+#define REORDER_BUFFER_SIZE 65536
+
+/*
+ * RING_SIZE: Size of inter-thread communication rings.
+ * 
+ * Rings connect workers to reorder threads and reorder threads to TX threads.
+ * Should be large enough to handle burst traffic without blocking.
+ * 
+ * WHEN TO INCREASE:
+ * - Seeing "Enqueue failed" counter increasing in stats
+ * - Very bursty traffic patterns
+ * 
+ * Rule of thumb: At least 2x REORDER_BUFFER_SIZE
+ */
+#define RING_SIZE 131072
+
 #define MAX_RX_QUEUES_PER_PORT 8   /* Maximum RX queues per port */
 
 /* 
- * Timeout for lost packets (microseconds).
+ * REORDER_TIMEOUT_US: Timeout for lost packets (microseconds).
+ * 
  * If a packet hasn't arrived after this time, assume it's lost and skip it.
- * Set to 2 seconds to allow for reasonable network delays.
+ * This allows the reorder buffer to make progress when packets are truly lost.
+ * 
+ * CRITICAL: Must be LONGER than your maximum expected packet delay!
+ * 
+ * WHEN TO INCREASE:
+ * - Packet delays longer than current timeout
+ * - Seeing high "Timeout flushes" with packets that should have arrived
+ * - For 350-500ms delays, use 600,000-700,000 (600-700ms)
+ * 
+ * WHEN TO DECREASE:
+ * - Delays are shorter and you want faster recovery from true packet loss
+ * - Network has minimal delay variation
+ * 
+ * Current: 500ms (500,000 us) - works for delays up to ~400ms
  */
-#define REORDER_TIMEOUT_US 2000000
+#define REORDER_TIMEOUT_US 500000
 
 /* NIC descriptor ring sizes */
 #define RX_DESC_DEFAULT 1024
@@ -700,19 +793,22 @@ reorder_thread(void *arg)
 		 * 
 		 * If we have packets buffered but can't drain (waiting for a
 		 * missing packet), and timeout expires, assume packet is lost.
+		 * 
+		 * CONSERVATIVE SKIP: Only skip to min_buffered_seq (a packet we
+		 * KNOW is in the buffer). If we don't have min_buffered_seq,
+		 * skip just one packet. Never overshoot beyond known packets.
 		 */
 		expected_seq = rte_atomic32_read(args->expected_seq);
 		if (has_buffered_pkts && (cur_tsc - last_progress_tsc > timeout_tsc)) {
 			/* Only timeout if we're actually stuck (expected_seq unchanged) */
 			if (expected_seq == last_expected && rte_atomic32_read(args->first_pkt_init) != 0) {
-				/*
-				 * SMART SKIP: Instead of incrementing by 1, jump to the
-				 * minimum sequence number we have in the buffer.
-				 * This efficiently handles large gaps.
-				 */
 				uint32_t new_expected;
 				uint32_t skipped;
 				
+				/*
+				 * Skip to min_buffered_seq if we have it - this is a packet
+				 * we KNOW exists in the buffer. Otherwise, skip just 1.
+				 */
 				if (min_buffered_seq != UINT32_MAX && min_buffered_seq > expected_seq) {
 					new_expected = min_buffered_seq;
 					skipped = new_expected - expected_seq;
@@ -722,40 +818,29 @@ reorder_thread(void *arg)
 					skipped = 1;
 				}
 				
-				/* Tell rte_reorder to advance its internal min_seqn */
+				/* Advance reorder buffer */
 				rte_reorder_min_seqn_set(args->reorder_buf,
 					(rte_reorder_seqn_t)new_expected);
-				
-				/* Update our tracking */
 				rte_atomic32_set(args->expected_seq, new_expected);
 				lcore_stat->timeout_flushed += skipped;
 				
 				if (debug_mode) {
 					RTE_LOG(WARNING, MACSEC_REORDER,
-						"[%s] TIMEOUT: skipping %u packets (%u -> %u)\n",
-						args->dir_str, skipped, expected_seq, new_expected);
+						"[%s] TIMEOUT: skipping %u packets (%u -> %u), min_buf=%u\n",
+						args->dir_str, skipped, expected_seq, new_expected,
+						min_buffered_seq);
 				}
 				
+				/* Reset ONLY after using */
 				min_buffered_seq = UINT32_MAX;
 				
-				/*
-				 * Immediately try to drain after skipping.
-				 * The packets at new_expected may now be available.
-				 */
+				/* Drain all available packets after skip */
+				bool drained_any = false;
 				nb_drained = rte_reorder_drain(args->reorder_buf,
 					pkts_drained, MAX_PKT_BURST);
-				if (debug_mode && nb_drained == 0) {
-					RTE_LOG(WARNING, MACSEC_REORDER,
-						"[%s] POST-TIMEOUT: drain returned 0 (buffer may be empty at min_seqn=%u)\n",
-						args->dir_str, new_expected);
-				}
 				while (nb_drained > 0) {
+					drained_any = true;
 					lcore_stat->reordered_pkts += nb_drained;
-					if (debug_mode) {
-						RTE_LOG(INFO, MACSEC_REORDER,
-							"[%s] POST-TIMEOUT DRAIN: %u packets\n",
-							args->dir_str, nb_drained);
-					}
 					for (i = 0; i < nb_drained; i++) {
 						drained_seq = *rte_reorder_seqn(pkts_drained[i]);
 						if (rte_ring_enqueue(args->tx_ring, pkts_drained[i]) != 0) {
@@ -765,11 +850,21 @@ reorder_thread(void *arg)
 						}
 						rte_atomic32_set(args->expected_seq, drained_seq + 1);
 					}
-					/* Keep draining until empty */
 					nb_drained = rte_reorder_drain(args->reorder_buf,
 						pkts_drained, MAX_PKT_BURST);
 				}
-				last_progress_tsc = cur_tsc;
+				
+				/* 
+				 * Reset timeout timer. If we drained packets, reset normally.
+				 * If we didn't drain, add a small delay (1/10 of timeout)
+				 * before trying again to allow delayed packets to arrive.
+				 */
+				if (drained_any) {
+					last_progress_tsc = cur_tsc;
+				} else {
+					/* Didn't drain - wait a fraction of timeout before retry */
+					last_progress_tsc = cur_tsc - (timeout_tsc * 9 / 10);
+				}
 			}
 		}
 		last_expected = expected_seq;
